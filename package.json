@@ -1,0 +1,17 @@
+{
+  "name": "luarmor-proxy",
+  "version": "1.0.0",
+  "description": "Proxy API between Lovable/Supabase and Luarmor API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "@supabase/supabase-js": "^2.49.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
