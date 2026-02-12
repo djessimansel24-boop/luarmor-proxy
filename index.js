@@ -6,86 +6,96 @@ const PORT = process.env.PORT || 3000;
 const LUARMOR_API_KEY = process.env.LUARMOR_API_KEY;
 const LUARMOR_PROJECT_ID = process.env.LUARMOR_PROJECT_ID;
 const PROXY_SECRET = process.env.PROXY_SECRET;
+const LUARMOR_BASE = `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}`;
 
-// Validation au démarrage
 if (!LUARMOR_API_KEY || !LUARMOR_PROJECT_ID || !PROXY_SECRET) {
-  console.error("FATAL: Missing LUARMOR_API_KEY, LUARMOR_PROJECT_ID, or PROXY_SECRET");
+  console.error("FATAL: Missing env vars");
   process.exit(1);
 }
 
 app.use(express.json());
 
-// ─────────────────────────────────────────────
-// Middleware : vérifie le secret partagé
-// Seules tes Edge Functions Lovable connaissent ce secret
-// ─────────────────────────────────────────────
+const luarmorHeaders = {
+  Authorization: LUARMOR_API_KEY,
+  "Content-Type": "application/json",
+};
 
 function verifySecret(req, res, next) {
-  const secret = req.headers["x-proxy-secret"];
-  if (secret !== PROXY_SECRET) {
+  if (req.headers["x-proxy-secret"] !== PROXY_SECRET) {
     return res.status(403).json({ success: false, error: "Unauthorized" });
   }
   next();
 }
 
-// ─────────────────────────────────────────────
-// ROUTE 1 : POST /luarmor/create-key
-// Crée une clé Luarmor (expirée par défaut)
-// Body attendu : { note: "user_id" }
-// ─────────────────────────────────────────────
+// Helper : appel Luarmor avec logs complets
+async function luarmorCall(method, path, body = null) {
+  const url = path.startsWith("http") ? path : `${LUARMOR_BASE}${path}`;
+  const options = { method, headers: luarmorHeaders };
+  if (body) options.body = JSON.stringify(body);
 
+  console.log(`[LUARMOR] ${method} ${url}`);
+  if (body) console.log(`[LUARMOR] Body:`, JSON.stringify(body));
+
+  const res = await fetch(url, options);
+  const text = await res.text();
+  console.log(`[LUARMOR] Status: ${res.status} Response: ${text}`);
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { success: false, raw: text };
+  }
+}
+
+// ─────────────────────────────────────────────
+// POST /luarmor/create-key
+// Crée une clé + l'expire immédiatement
+// ─────────────────────────────────────────────
 app.post("/luarmor/create-key", verifySecret, async (req, res) => {
   try {
     const { note } = req.body;
+    console.log("\n========== CREATE KEY ==========");
 
-    // Étape 1 : Créer la clé
-    const createRes = await fetch(
-      `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}/users`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: LUARMOR_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ note: note || "" }),
-      }
-    );
-    const createData = await createRes.json();
+    // Étape 1 : Créer la clé avec expiration directement dans le body
+    const yesterdayTimestamp = Math.floor(Date.now() / 1000) - 86400;
+    console.log("Timestamp hier:", yesterdayTimestamp, "=", new Date(yesterdayTimestamp * 1000).toISOString());
+
+    // Tentative 1 : créer avec auth_expire directement
+    const createData = await luarmorCall("POST", "/users", {
+      note: note || "",
+      auth_expire: yesterdayTimestamp,
+    });
 
     if (!createData.success) {
-      return res.status(502).json({ success: false, error: createData.message });
+      console.log("CREATE FAILED:", JSON.stringify(createData));
+      return res.status(502).json({ success: false, error: createData.message || "Create failed" });
     }
 
-    // Étape 2 : Expirer immédiatement la clé (pas de plan actif)
-    const patchRes = await fetch(
-      `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}/users`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: LUARMOR_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          user_key: createData.user_key,
-          auth_expire: Math.floor(Date.now() / 1000) - 86400,
-        }),
-      }
-    );
-    const patchData = await patchRes.json();
+    const userKey = createData.user_key;
+    console.log("Key created:", userKey);
 
-    if (!patchData.success) {
-      // Rollback : supprime la clé
-      await fetch(
-        `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}/users?user_key=${createData.user_key}`,
-        {
-          method: "DELETE",
-          headers: { Authorization: LUARMOR_API_KEY, "Content-Type": "application/json" },
-        }
-      );
-      return res.status(502).json({ success: false, error: patchData.message });
+    // Étape 2 : PATCH pour être sûr que l'expiration est en place
+    console.log("--- PATCH auth_expire ---");
+    const patch1 = await luarmorCall("PATCH", "/users", {
+      user_key: userKey,
+      auth_expire: yesterdayTimestamp,
+    });
+
+    // Étape 3 : Si PATCH échoue ou ne prend pas, essayer d'autres noms de champ
+    if (!patch1.success) {
+      console.log("--- PATCH auth_expire FAILED, trying 'expiry' ---");
+      await luarmorCall("PATCH", "/users", {
+        user_key: userKey,
+        expiry: yesterdayTimestamp,
+      });
     }
 
-    return res.json({ success: true, user_key: createData.user_key });
+    // Étape 4 : Vérifier le résultat
+    console.log("--- VERIFY ---");
+    const verify = await luarmorCall("GET", `/users?user_key=${userKey}`);
+    console.log("========== CREATE KEY END ==========\n");
+
+    return res.json({ success: true, user_key: userKey });
   } catch (err) {
     console.error("create-key error:", err);
     return res.status(500).json({ success: false, error: "Internal error" });
@@ -93,34 +103,30 @@ app.post("/luarmor/create-key", verifySecret, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ROUTE 2 : POST /luarmor/activate-plan
-// Active une clé avec une date d'expiration
-// Body attendu : { user_key: "xxx", auth_expire: 1234567890 }
+// POST /luarmor/activate-plan
 // ─────────────────────────────────────────────
-
 app.post("/luarmor/activate-plan", verifySecret, async (req, res) => {
   try {
     const { user_key, auth_expire } = req.body;
+    console.log("\n========== ACTIVATE PLAN ==========");
+    console.log("Key:", user_key);
+    console.log("Expire:", auth_expire, "=", new Date(auth_expire * 1000).toISOString());
 
     if (!user_key || !auth_expire) {
       return res.status(400).json({ success: false, error: "Missing user_key or auth_expire" });
     }
 
-    const patchRes = await fetch(
-      `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}/users`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: LUARMOR_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ user_key, auth_expire }),
-      }
-    );
-    const patchData = await patchRes.json();
+    const patchData = await luarmorCall("PATCH", "/users", {
+      user_key,
+      auth_expire,
+    });
+
+    // Vérifier
+    const verify = await luarmorCall("GET", `/users?user_key=${user_key}`);
+    console.log("========== ACTIVATE END ==========\n");
 
     if (!patchData.success) {
-      return res.status(502).json({ success: false, error: patchData.message });
+      return res.status(502).json({ success: false, error: patchData.message || "Activate failed" });
     }
 
     return res.json({ success: true });
@@ -131,34 +137,26 @@ app.post("/luarmor/activate-plan", verifySecret, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// ROUTE 3 : POST /luarmor/reset-hwid
-// Reset le HWID d'une clé
-// Body attendu : { user_key: "xxx" }
+// POST /luarmor/reset-hwid
 // ─────────────────────────────────────────────
-
 app.post("/luarmor/reset-hwid", verifySecret, async (req, res) => {
   try {
     const { user_key } = req.body;
+    console.log("\n========== RESET HWID ==========");
 
     if (!user_key) {
       return res.status(400).json({ success: false, error: "Missing user_key" });
     }
 
-    const resetRes = await fetch(
-      `https://api.luarmor.net/v3/projects/${LUARMOR_PROJECT_ID}/users/resethwid`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: LUARMOR_API_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ user_key, force: true }),
-      }
-    );
-    const resetData = await resetRes.json();
+    const resetData = await luarmorCall("POST", "/users/resethwid", {
+      user_key,
+      force: true,
+    });
+
+    console.log("========== RESET END ==========\n");
 
     if (!resetData.success) {
-      return res.status(502).json({ success: false, error: resetData.message });
+      return res.status(502).json({ success: false, error: resetData.message || "Reset failed" });
     }
 
     return res.json({ success: true });
@@ -168,12 +166,7 @@ app.post("/luarmor/reset-hwid", verifySecret, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
-// Utilitaire : trouver l'IP sortante
-// Visite /my-ip après déploiement, note l'IP,
-// whiteliste-la sur luarmor.net/profile
-// ─────────────────────────────────────────────
-
+// Utilitaires
 app.get("/my-ip", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json");
@@ -184,9 +177,8 @@ app.get("/my-ip", async (req, res) => {
   }
 });
 
-// Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", time: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
