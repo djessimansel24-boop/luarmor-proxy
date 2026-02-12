@@ -67,7 +67,7 @@ app.post("/luarmor/create-key", verifySecret, async (req, res) => {
         },
         body: JSON.stringify({
           user_key: createData.user_key,
-          auth_expire: 1,
+          auth_expire: Math.floor(Date.now() / 1000) - 86400,
         }),
       }
     );
